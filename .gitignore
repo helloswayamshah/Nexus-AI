@@ -2,6 +2,8 @@ node_modules/
 .env
 .env.*
 !.env.example
+oracle/.env
+!oracle/.env.example
 data/
 /models/
 *.log
@@ -12,3 +14,5 @@ oracle/dev.db
 oracle/*.db
 __pycache__/
 *.pyc
+*.egg-info/
+.venv/

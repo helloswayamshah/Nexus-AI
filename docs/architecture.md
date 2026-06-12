@@ -1,5 +1,9 @@
 # Nexus — Central AI Oracle: Architecture & Implementation Plan
 
+> **Core Problem Statement:** Teams suffer from *context fragmentation* — knowledge is spread across Discord voice calls, Slack threads, docs, and individual contributors' heads. New hires can't onboard without pestering teammates. Managers can't see team/member performance without digging through logs. Nobody can ask a question across all those sources at once.
+>
+> Nexus solves this by capturing every communication event, normalizing it into a unified knowledge graph, and exposing a natural-language query interface so anyone can ask questions like "What did the frontend team ship last sprint?" or "Show me Sarah's action items across all calls this month."
+
 ## Current State Inventory
 
 | Layer | Files | Tech | Health |
@@ -66,10 +70,13 @@ graph TB
     REPO["Repositories<br/>OrgRepo, EventRepo<br/>ArtifactRepo, UserRepo"]
     PIPE["Intelligence Pipeline<br/>Transcription → Summary<br/>→ Action Items → Insights"]
     Q["Task Queue<br/>asyncio (v1)<br/>→ Celery (v2)"]
+    KG["Knowledge Graph Builder<br/>Entity extraction,<br/>topic clustering, embeddings"]
+    QE["Query Engine<br/>RAG + LLM reasoning<br/>Natural-language answers"]
   end
 
   subgraph "Storage"
     DB[(PostgreSQL / SQLite)]
+    VDB["Vector Store<br/>(pgvector / Chroma)"]
     OBJ["Object Storage<br/>(audio files)"]
   end
 
@@ -78,9 +85,18 @@ graph TB
     WH["faster-whisper"]
   end
 
+  subgraph "Query Interfaces"
+    DCQ["Discord /ask command"]
+    SLQ["Slack /ask command"]
+    WEBQ["Web Chat UI<br/>(future)"]
+  end
+
   DA -->|"POST /orgs/{id}/events"| API
   SA -->|"POST /orgs/{id}/events"| API
   ZA -.->|"POST /orgs/{id}/events"| API
+  DCQ -->|"POST /orgs/{id}/query"| API
+  SLQ -->|"POST /orgs/{id}/query"| API
+  WEBQ -.->|"POST /orgs/{id}/query"| API
   API --> SVC
   SVC --> REPO
   SVC --> Q
@@ -89,6 +105,13 @@ graph TB
   PIPE --> WH
   PIPE --> OL
   PIPE --> REPO
+  PIPE --> KG
+  KG --> VDB
+  KG --> DB
+  QE --> VDB
+  QE --> REPO
+  QE --> OL
+  API --> QE
 ```
 
 ---
@@ -112,17 +135,22 @@ nexus/
 │   │   │       ├── action_items.py
 │   │   │       ├── platform_links.py
 │   │   │       ├── insights.py
+│   │   │       ├── query.py         # NEW: /orgs/{id}/query — NL question answering
 │   │   │       └── auth.py
 │   │   ├── services/
 │   │   │   ├── event_service.py
 │   │   │   ├── artifact_service.py
 │   │   │   ├── identity_service.py
 │   │   │   ├── crypto_service.py
-│   │   │   └── intelligence/
-│   │   │       ├── pipeline.py      # Orchestrator
-│   │   │       ├── transcriber.py   # faster-whisper + OpenAI
-│   │   │       ├── summarizer.py    # Ollama / OpenAI LLM
-│   │   │       └── insight_engine.py
+│   │   │   ├── intelligence/
+│   │   │   │   ├── pipeline.py      # Orchestrator
+│   │   │   │   ├── transcriber.py   # faster-whisper + OpenAI
+│   │   │   │   ├── summarizer.py    # Ollama / OpenAI LLM
+│   │   │   │   └── insight_engine.py
+│   │   │   └── knowledge/
+│   │   │       ├── graph_builder.py # Entity/topic extraction, embedding
+│   │   │       ├── embedder.py      # Text → vector via Ollama/OpenAI
+│   │   │       └── query_engine.py  # RAG retrieval + LLM reasoning
 │   │   ├── repositories/
 │   │   │   ├── base.py              # BaseRepository with org_id scoping
 │   │   │   ├── org_repo.py
@@ -138,6 +166,7 @@ nexus/
 │   │   │   ├── event.py
 │   │   │   ├── artifact.py
 │   │   │   ├── platform.py
+│   │   │   ├── chunk.py             # NEW: embedded text chunks (pgvector)
 │   │   │   └── enums.py
 │   │   ├── schemas/                 # Pydantic request/response
 │   │   │   ├── org.py
@@ -291,6 +320,40 @@ nexus/
 
 ---
 
+### Phase 7: Knowledge Graph & Semantic Search
+**Duration:** 5-7 days | **Risk:** Medium
+**Purpose:** Solve context fragmentation — index all artifacts into a searchable vector store so nothing gets lost.
+
+This phase transforms Nexus from a *recorder* into a *knowledge base*. Every summary, transcript, and action item gets chunked, embedded, and stored in pgvector so any question can be answered by retrieval over the full org history.
+
+| Step | Deliverable | Details |
+|---|---|---|
+| 7.1 | pgvector extension | Add `pgvector` to Postgres via Alembic migration. Add `Chunk` model with `embedding vector(1536)` column. SQLite fallback uses Chroma for dev. |
+| 7.2 | `oracle/app/services/knowledge/embedder.py` | `EmbedderService.embed(texts: list[str]) -> list[list[float]]`. Backends: Ollama `nomic-embed-text` (local) or OpenAI `text-embedding-3-small` (hosted). Config-driven per org. |
+| 7.3 | `oracle/app/services/knowledge/graph_builder.py` | `GraphBuilder.index_artifact(artifact_id)`: (1) Load artifact content, (2) Chunk by semantic boundary (512-token windows, 64-token overlap), (3) Embed each chunk, (4) Persist `Chunk` rows with org_id, source, team, participants as metadata. Called from intelligence pipeline after summary is written. |
+| 7.4 | Retroactive indexing job | `oracle/app/services/knowledge/reindex.py` — one-shot script that indexes all existing artifacts. Idempotent (skips already-indexed). |
+| 7.5 | `GET /orgs/{id}/search` | Semantic search endpoint. Takes `q: str`, optional `team_id`, `user_id`, `date_range`. Returns top-K chunks with source metadata (event_id, artifact_id, occurred_at, participants). Used by dev tools and future UI. |
+| 7.6 | Metadata filters on vector search | `WHERE org_id = ? AND (team_id = ? OR team_id IS NULL) AND occurred_at > ?` applied as pre-filter before ANN search. Prevents cross-org leakage (security invariant). |
+| 7.7 | Tests | Unit tests for chunking logic. Integration test: POST event → wait for pipeline → search for keyword from transcript → verify chunk is returned. |
+
+### Phase 8: Natural-Language Query Interface (`/ask`)
+**Duration:** 4-5 days | **Risk:** Medium
+**Purpose:** Boost productivity and onboarding — anyone can ask questions about team work without hunting through channels.
+
+| Step | Deliverable | Details |
+|---|---|---|
+| 8.1 | `oracle/app/services/knowledge/query_engine.py` | `QueryEngine.answer(org_id, question, filters) -> QueryResponse`. Flow: (1) Classify question type (team summary / member performance / recent events / onboarding), (2) Retrieve top-K chunks via semantic search, (3) Build context window from chunks + metadata, (4) LLM completion with structured output: `{answer, sources, confidence}`. |
+| 8.2 | Question type routing | **Team questions** (`"What did the backend team do last week?"`): filter by team_id + date. **Member questions** (`"What's Alice working on?"`): filter by user identity. **Onboarding questions** (`"How do we deploy?"`): broad search, no date filter. **Event questions** (`"What was decided in Monday's call?"`): filter by event date + type. |
+| 8.3 | `POST /orgs/{id}/query` | Request: `{ question: str, context?: { team_id?, user_id?, date_range? } }`. Response: `{ answer: str, sources: [{event_id, occurred_at, excerpt, participants}], confidence: "high|medium|low" }`. Streaming response via SSE for long answers. |
+| 8.4 | Discord `/ask` command | `adapters/discord/src/commands/ask.js` — takes free-text question, POSTs to oracle `/query`, formats answer as Discord embed with source citations. Respects team-scoping: if run in a team's channel, auto-filters to that team. |
+| 8.5 | Slack `/ask` command | Same pattern for `adapters/slack/src/commands/ask.js`. Uses Slack Block Kit for rich source display. |
+| 8.6 | Onboarding mode | `POST /orgs/{id}/query?mode=onboard` — broader context window, no date filter, returns up to 5 sources. Aimed at new hires asking foundational questions. |
+| 8.7 | Performance baseline | `GET /orgs/{id}/members/{user_id}/performance?period=30d` — structured endpoint (not NL) returning: events attended, action items opened/closed, summary of topics contributed to. Used by managers; powers the NL answer for member queries. |
+| 8.8 | Answer caching | Cache identical `(org_id, question_hash, filters_hash)` for 5 minutes. Prevents hammering LLM on repeated `/ask` calls in busy channels. Redis (v2) / in-memory LRU (v1). |
+| 8.9 | Tests | Eval harness: 10 golden Q&A pairs per question type. Run after any pipeline or embedding change to catch regressions. |
+
+---
+
 ## Schema ER Diagram
 
 ```mermaid
@@ -314,6 +377,19 @@ erDiagram
     Event ||--o{ Artifact : produces
 
     Artifact ||--o{ ActionItem : contains
+    Artifact ||--o{ Chunk : split_into
+    Event ||--o{ Chunk : indexed_from
+
+    Chunk {
+        uuid id PK
+        uuid org_id FK
+        uuid source_artifact_id FK "nullable"
+        uuid source_event_id FK "nullable"
+        text content
+        vector embedding "pgvector"
+        json metadata_json
+        timestamp created_at
+    }
 
     Org {
         uuid id PK
@@ -455,6 +531,31 @@ class TaskQueue(Protocol):
     async def get_status(self, job_id: str) -> JobStatus: ...
 ```
 
+### 6. RAG Query Pattern (Context Fragmentation Fix)
+```
+User: "What did the backend team decide about auth last month?"
+         │
+         ▼
+  1. Classify: team_query, team=backend, date_range=last 30d
+         │
+         ▼
+  2. Retrieve: pgvector ANN search on Chunk
+     WHERE org_id = ? AND team_id = backend AND occurred_at > 30d ago
+     → top 8 chunks from calls, Slack threads, summaries
+         │
+         ▼
+  3. Build context window: chunk content + source metadata
+         │
+         ▼
+  4. LLM completion:
+     "Given these excerpts from your team's history, answer: ..."
+         │
+         ▼
+  5. Response: { answer, sources: [{event, date, participants}] }
+```
+
+Org isolation is enforced at retrieval step (step 2) — `org_id` is a pre-filter on the ANN search, not a post-filter. A user can never receive chunks from another org regardless of what they ask.
+
 ---
 
 ## Risk Matrix
@@ -471,15 +572,35 @@ class TaskQueue(Protocol):
 
 ## Timeline Summary
 
-| Phase | Duration | Cumulative | Status |
-|---|---|---|---|
-| Phase 0: Restructure | 1 day | 1 day | ✅ Complete |
-| Phase 1: Oracle Foundation | (merged into Phase 0) | ~1 day | ✅ Complete |
-| Phase 2: Oracle API | 3-4 days | ~1 week | 🔲 Next |
-| Phase 3: Adapter Rewiring | 3-4 days | ~2 weeks | 🔲 |
-| Phase 4: Intelligence | 5-7 days | ~3 weeks | 🔲 |
-| Phase 5: Docker & CI | 2-3 days | ~3.5 weeks | 🔲 |
-| Phase 6: Polish | 2-3 days | **~4 weeks** | 🔲 |
+| Phase | Focus | Duration | Cumulative | Status |
+|---|---|---|---|---|
+| Phase 0: Restructure | Monorepo foundation | 1 day | 1 day | ✅ Complete |
+| Phase 1: Oracle Foundation | Models, migrations, repos | (merged into Phase 0) | ~1 day | ✅ Complete |
+| Phase 2: Oracle API | Auth, routes, validation | 3-4 days | ~1 week | 🔲 Next |
+| Phase 3: Adapter Rewiring | Stateless adapters → oracle | 3-4 days | ~2 weeks | 🔲 |
+| Phase 4: Intelligence | Transcription, summarization | 5-7 days | ~3 weeks | 🔲 |
+| Phase 5: Docker & CI | Orchestration, multi-arch | 2-3 days | ~3.5 weeks | 🔲 |
+| Phase 6: Polish | Hardening, docs, migrations | 2-3 days | ~4 weeks | 🔲 |
+| Phase 7: Knowledge Graph | Embeddings, vector search | 5-7 days | ~5.5 weeks | 🔲 |
+| Phase 8: /ask Interface | NL queries, onboarding, perf | 4-5 days | **~7 weeks** | 🔲 |
 
 > [!TIP]
-> **Recommended shipping strategy:** Ship Phase 0-3 first with `USE_ORACLE=false` as default. This gets the oracle running alongside the existing pipeline with zero user-facing changes. Then flip `USE_ORACLE=true` per-org to validate incrementally before cutting over fully.
+> **Recommended shipping strategy:**
+> - **Ship Phase 0-3** with `USE_ORACLE=false` as default. Zero user-facing changes, oracle runs alongside legacy pipeline.
+> - **Flip `USE_ORACLE=true`** per-org after Phase 4 to validate intelligence incrementally.
+> - **Phase 7 depends on Phase 4** (artifacts must exist to index). Run in parallel with Phase 5-6.
+> - **Phase 8 depends on Phase 7** (vector store must be populated). `/ask` is the first user-visible feature that directly addresses context fragmentation.
+
+---
+
+## Context Fragmentation: Problem → Feature Map
+
+| Pain Point | Feature | Phase |
+|---|---|---|
+| "I missed that call, what was decided?" | Auto-summary posted to channel | Phase 4 |
+| "I'm new, where do I find X?" | `/ask` onboarding mode — broad search, no date filter | Phase 8 |
+| "What's the backend team been shipping?" | `/ask` with team filter | Phase 8 |
+| "What's Alice's workload this month?" | `/ask` member query + `/performance` endpoint | Phase 8 |
+| "Find all action items assigned to me" | `GET /action-items?assignee=me` | Phase 2 |
+| "What did we discuss about auth last quarter?" | `GET /search?q=auth` semantic search | Phase 7 |
+| Can't search across Discord + Slack at once | Unified event + chunk store, platform-agnostic search | Phase 7 |
