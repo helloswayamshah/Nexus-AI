@@ -2,7 +2,17 @@ node_modules/
 .env
 .env.*
 !.env.example
+oracle/.env
+!oracle/.env.example
 data/
-models/
+/models/
 *.log
 .claude/
+
+# Oracle dev database
+oracle/dev.db
+oracle/*.db
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
