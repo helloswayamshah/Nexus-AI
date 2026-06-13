@@ -1,10 +1,3 @@
-"""
-FastAPI application factory.
-
-Creates the app, registers routes, and manages the database engine lifecycle
-via the lifespan context manager.
-"""
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,14 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.api.routes import orgs, events, artifacts, action_items, platform_links, auth, insights
+from app.core.errors import register_error_handlers
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Startup / shutdown lifecycle hook."""
-    # Import here to avoid circular deps at module level
     from app.api.deps import init_engine, dispose_engine
-
     settings = get_settings()
     await init_engine(settings.database_url)
     yield
@@ -32,11 +23,10 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         description="Central AI Oracle — the connective tissue across all your platforms.",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
-    # CORS — permissive for dev, tighten in production
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -45,7 +35,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ── Routes ───────────────────────────────────────────────────────────
+    register_error_handlers(app)
+
     app.include_router(auth.router, prefix="/auth", tags=["Auth"])
     app.include_router(orgs.router, prefix="/orgs", tags=["Orgs"])
     app.include_router(events.router, prefix="/orgs/{org_id}/events", tags=["Events"])
@@ -56,7 +47,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["System"])
     async def health():
-        return {"status": "ok", "service": "nexus-oracle"}
+        return {"status": "ok", "service": "nexus-oracle", "version": "0.2.0"}
 
     return app
 
