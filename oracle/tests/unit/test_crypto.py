@@ -121,29 +121,30 @@ class TestKeyLoading:
         os.environ["ENCRYPTION_KEY"] = VALID_B64_KEY
         assert len(crypto._load_key()) == 32
 
-    def test_missing_key_returns_none(self):
+    def _reset(self, key: str = ""):
+        from app.config import get_settings
         crypto._cached_key = None
-        os.environ["ENCRYPTION_KEY"] = ""
+        os.environ["ENCRYPTION_KEY"] = key
+        get_settings.cache_clear()
+
+    def test_missing_key_returns_none(self):
+        self._reset("")
         assert crypto._load_key() is None
 
     def test_invalid_key_raises_value_error(self):
-        crypto._cached_key = None
-        os.environ["ENCRYPTION_KEY"] = "tooshort"
+        self._reset("tooshort")
         with pytest.raises(ValueError, match="must decode to"):
             crypto._load_key()
 
     def test_encrypt_without_key_raises_runtime_error(self):
-        crypto._cached_key = None
-        os.environ["ENCRYPTION_KEY"] = ""
+        self._reset("")
         with pytest.raises(RuntimeError, match="ENCRYPTION_KEY is not set"):
             crypto.encrypt("secret")
 
     def test_is_key_configured_true(self):
-        crypto._cached_key = None
-        os.environ["ENCRYPTION_KEY"] = VALID_HEX_KEY
+        self._reset(VALID_HEX_KEY)
         assert crypto.is_key_configured() is True
 
     def test_is_key_configured_false_when_missing(self):
-        crypto._cached_key = None
-        os.environ["ENCRYPTION_KEY"] = ""
+        self._reset("")
         assert crypto.is_key_configured() is False

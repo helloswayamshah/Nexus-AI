@@ -387,10 +387,10 @@ k8s-logs:
 .PHONY: test
 ifeq ($(OS),Windows_NT)
 test: install
-	Set-Location $(ORACLE_DIR); uv run pytest
+	Set-Location $(ORACLE_DIR); uv sync --extra dev --quiet; .\.venv\Scripts\python.exe -m pytest
 else
 test: install
-	cd $(ORACLE_DIR) && uv run pytest
+	cd $(ORACLE_DIR) && uv sync --extra dev --quiet && .venv/bin/python -m pytest
 endif
 
 .PHONY: lint

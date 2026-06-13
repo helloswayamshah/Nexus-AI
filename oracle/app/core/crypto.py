@@ -21,7 +21,13 @@ def _load_key() -> bytes | None:
     if _cached_key is not None:
         return _cached_key
 
-    raw = os.environ.get("ENCRYPTION_KEY", "").strip()
+    # Prefer pydantic-settings value; fall back to raw os.environ for CLI use
+    try:
+        from app.config import get_settings
+        raw = get_settings().encryption_key.strip()
+    except Exception:
+        raw = os.environ.get("ENCRYPTION_KEY", "").strip()
+
     if not raw:
         return None
 
